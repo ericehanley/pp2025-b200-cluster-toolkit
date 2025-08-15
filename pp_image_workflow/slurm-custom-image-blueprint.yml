@@ -13,7 +13,7 @@
 # limitations under the License.
 ---
 
-blueprint_name: a4high-slurm
+blueprint_name: pp-custom-slurm-image
 
 vars:
   deployment_name: # supply deployment name
@@ -24,7 +24,7 @@ vars:
   base_image:
     project: ubuntu-os-accelerator-images
     image: ubuntu-accelerator-2204-amd64-with-nvidia-570-v20250722
-  image_build_machine_type: n2-standard-16
+  image_build_machine_type: n2-standard-32
   build_slurm_from_git_ref: 6.10.0
   # Cluster Settings
   instance_image:
@@ -99,6 +99,95 @@ deployment_groups:
             "allow_kernel_upgrades": false,
             "monitoring_agent": "cloud-ops",
           }
+          
+      - type: ansible-local
+        destination: install_python.yml
+        content: |
+          ---
+          - name: Install Python 3.11 and Git
+            hosts: all
+            become: true
+            tasks:
+            - name: Update apt cache
+              ansible.builtin.apt:
+                update_cache: true
+            - name: Install prerequisites for adding repositories
+              ansible.builtin.apt:
+                name: software-properties-common
+                state: present
+            - name: Add deadsnakes PPA for modern Python versions
+              ansible.builtin.apt_repository:
+                repo: ppa:deadsnakes/ppa
+                state: present
+            - name: Install Python 3.11, pip, and Git
+              ansible.builtin.apt:
+                name:
+                - python3.11
+                - python3.11-venv
+                - python3-pip
+                - git
+                state: present
+
+      - type: data
+        destination: /tmp/requirements.txt
+        content: |
+          numpy>=2.0.2
+          gymnasium==0.29.1 # -- loosen
+          lightning>=2.5.0.post0
+          torchvision>=0.21.0
+          deepspeed>=0.14.5
+          peft>=0.15.2
+          transformers[torch]>=4.49.0
+          tensorflow>=2.18.0 # Confirm TF version
+          tensorflow-text>=2.18.1 # Adjusted to match TF version
+          keras-nlp>=0.19.3
+          tf-keras>=2.18.0 # Adjusted to match TF version
+          ray>=2.43.0
+          cut-cross-entropy
+
+          torch>=2.7.0 # wheel file? torch-2.7.0+cu126-cp311-cp311-manylinux_2_28_x86_64.whl
+          tensordict==0.8.3 # wheel file? tensordict-0.7.2-cp311-cp311-manylinux1_x86_64.whl
+          torchrl==0.8.1 
+          torchtune==0.6.0
+          torch-tb-profiler>=0.4.3
+          torchao>=0.9.0
+          compressed-tensors>=0.9.3
+
+          hydra-core>=1.3.2
+          pretty-midi>=0.2.10
+          tensorboard>=2.18.0 # Adjusted to match TF version
+          ipykernel>=6.29.5
+          hatchling>=1.27.0
+          editables>=0.5
+          psutil>=5.9.0
+          tenacity>=9.1.2
+          pydantic>=2.11.3
+          pydantic-core>=2.33.1
+          huggingface-hub>=0.30.0
+          lm-format-enforcer>=0.10.11
+          mistral-common>=1.5.4
+          numba>=0.61.2
+          setuptools>=78.1.0
+          cmake>=3.25.0,<=3.26.3
+          # appworld>=0.1.3 -- dependency conflict
+          coverage>=7.6.12
+          httptools>=0.6.4
+          xgrammar>=0.1.18
+          singleton-decorator>=1.0.0
+          regex>=2024.11.6
+
+          git+https://github.com/apple/ml-cross-entropy.git
+      - type: shell
+        destination: install_python_packages.sh
+        content: |
+          #!/bin/bash
+          set -e -o pipefail
+          echo "--- Upgrading pip for Python 3.11 ---"
+          python3.11 -m pip install --upgrade pip
+          echo "--- Installing packages from requirements.txt ---"
+          python3.11 -m pip install --no-cache-dir -r /tmp/requirements.txt
+          echo "--- Python package installation complete ---"
+
       - type: shell
         destination: install_slurm.sh
         content: |

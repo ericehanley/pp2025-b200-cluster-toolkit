@@ -14,7 +14,7 @@
 ---
 
 vars:
-  deployment_name: custom-slurm-image
+  deployment_name: pp-custom-slurm-image
   project_id: northam-ce-mlai-tpu
   region: us-central1
   zone: us-central1-a
