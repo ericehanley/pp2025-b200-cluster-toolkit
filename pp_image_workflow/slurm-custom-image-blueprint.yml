@@ -13,25 +13,40 @@
 # limitations under the License.
 ---
 
-blueprint_name: pp-custom-slurm-image
+blueprint_name: slurm-custom-img-cluster
 
 vars:
   deployment_name: # supply deployment name
   project_id: # supply project ID
   region: # supply region
   zone: # supply zone
+  a4h_cluster_size: # supply cluster size
   # Image settings
   base_image:
     project: ubuntu-os-accelerator-images
     image: ubuntu-accelerator-2204-amd64-with-nvidia-570-v20250722
-  image_build_machine_type: n2-standard-32
+  image_build_machine_type: n2-standard-16
   build_slurm_from_git_ref: 6.10.0
+  # Cluster env settings
+  # net0 and filestore ranges must not overlap
+  net0_range: 192.168.0.0/19
+  filestore_ip_range: 192.168.32.0/24
+  net1_range: 192.168.64.0/18
+  rdma_net_range: 192.168.128.0/18
   # Cluster Settings
+  local_ssd_mountpoint: /mnt/localssd
   instance_image:
     project: $(vars.project_id)
     family: $(vars.deployment_name)-u22
   disk_size_gb: 100
+  nccl_plugin_version: v1.0.6
+  benchmark_dir: $(ghpc_stage("system_benchmarks"))
   base_network_name: $(vars.deployment_name)
+
+  #Provisioning models (set to true or fill in reservation name, pick only one)
+  a4h_reservation_name: "" # supply reservation name
+  a4h_dws_flex_enabled: false
+  a4h_enable_spot_vm: false
 
 deployment_groups:
 - group: image-env
@@ -49,18 +64,13 @@ deployment_groups:
         enabled: true
         world_writable: true
       runners:
+      # --- STAGE 1: Install all system software and Slurm FIRST ---
       - type: data
         destination: /etc/apt/preferences.d/block-broken-nvidia-container
         content: |
           Package: nvidia-container-toolkit nvidia-container-toolkit-base libnvidia-container-tools libnvidia-container1
           Pin: version 1.17.7-1
           Pin-Priority: 100
-
-      # The following holds NVIDIA software that was already installed on the
-      # accelerator base image to be the same driver version. This reduces the
-      # risk of a driver version mismatch.
-      # Additional packages are held by:
-      # https://github.com/GoogleCloudPlatform/slurm-gcp/blob/master/ansible/group_vars/os_ubuntu.yml
       - type: ansible-local
         destination: hold-nvidia-packages.yml
         content: |
@@ -84,22 +94,65 @@ deployment_groups:
                 - hold
                 - "{{ item }}"
               loop: "{{ nvidia_packages_to_hold }}"
-
       - type: data
         destination: /var/tmp/slurm_vars.json
         content: |
-          {
-            "reboot": false,
-            "install_cuda": false,
-            "install_gcsfuse": true,
-            "install_lustre": false,
-            "install_managed_lustre": false,
-            "install_nvidia_repo": true,
-            "install_ompi": true,
-            "allow_kernel_upgrades": false,
-            "monitoring_agent": "cloud-ops",
-          }
-          
+          { "reboot": false, "install_cuda": false, "install_gcsfuse": true,
+            "install_lustre": false, "install_managed_lustre": false,
+            "install_nvidia_repo": true, "install_ompi": true,
+            "allow_kernel_upgrades": false, "monitoring_agent": "cloud-ops" }
+      - type: shell
+        destination: install_slurm.sh
+        content: |
+          #!/bin/bash
+          set -e -o pipefail
+          ansible-pull \
+              -U https://github.com/GoogleCloudPlatform/slurm-gcp -C $(vars.build_slurm_from_git_ref) \
+              -i localhost, --limit localhost --connection=local \
+              -e @/var/tmp/slurm_vars.json \
+              ansible/playbook.yml || true
+      - type: data
+        destination: /etc/security/limits.d/99-unlimited.conf
+        content: |
+          * - memlock unlimited
+          * - nproc unlimited
+          * - stack unlimited
+          * - nofile 1048576
+          * - cpu unlimited
+          * - rtprio unlimited
+      - type: ansible-local
+        destination: install_cuda_dcgm.yml
+        content: |
+          ---
+          - name: Install CUDA & DCGM
+            hosts: all
+            become: true
+            vars:
+              distribution: "{{ ansible_distribution | lower }}{{ ansible_distribution_version | replace('.','') }}"
+              cuda_repo_url: https://developer.download.nvidia.com/compute/cuda/repos/{{ distribution }}/x86_64/cuda-keyring_1.1-1_all.deb
+            tasks:
+            - name: Download NVIDIA repository package
+              ansible.builtin.get_url: { url: "{{ cuda_repo_url }}", dest: "/tmp/cuda-keyring.deb" }
+            - name: Install NVIDIA repository package
+              ansible.builtin.apt: { deb: "/tmp/cuda-keyring.deb", state: present }
+            - name: Install CUDA & DCGM
+              ansible.builtin.apt: { name: ["cuda-toolkit-12-8", "datacenter-gpu-manager-4-cuda12"], update_cache: true }
+      - type: ansible-local
+        destination: install_ibverbs_utils.yml
+        content: |
+          ---
+          - name: Install ibverbs-utils
+            hosts: all
+            become: true
+            tasks:
+            - name: Install Linux Modules Extra
+              ansible.builtin.package: { name: ibverbs-utils, state: present }
+      - type: data
+        destination: /etc/enroot/enroot.conf
+        content: |
+          ENROOT_CONFIG_PATH     ${HOME}/.enroot
+
+      # --- STAGE 2: Install Python and packages into an ISOLATED location ---
       - type: ansible-local
         destination: install_python.yml
         content: |
@@ -109,25 +162,15 @@ deployment_groups:
             become: true
             tasks:
             - name: Update apt cache
-              ansible.builtin.apt:
-                update_cache: true
+              ansible.builtin.apt: { update_cache: true }
             - name: Install prerequisites for adding repositories
-              ansible.builtin.apt:
-                name: software-properties-common
-                state: present
+              ansible.builtin.apt: { name: software-properties-common, state: present }
             - name: Add deadsnakes PPA for modern Python versions
-              ansible.builtin.apt_repository:
-                repo: ppa:deadsnakes/ppa
-                state: present
+              ansible.builtin.apt_repository: { repo: ppa:deadsnakes/ppa, state: present }
             - name: Install Python 3.11, pip, and Git
               ansible.builtin.apt:
-                name:
-                - python3.11
-                - python3.11-venv
-                - python3-pip
-                - git
+                name: ['python3.11', 'python3.11-venv', 'python3-pip', 'git']
                 state: present
-
       - type: data
         destination: /tmp/requirements.txt
         content: |
@@ -144,7 +187,6 @@ deployment_groups:
           tf-keras>=2.18.0 # Adjusted to match TF version
           ray>=2.43.0
           cut-cross-entropy
-
           torch>=2.7.0 # wheel file? torch-2.7.0+cu126-cp311-cp311-manylinux_2_28_x86_64.whl
           tensordict==0.8.3 # wheel file? tensordict-0.7.2-cp311-cp311-manylinux1_x86_64.whl
           torchrl==0.8.1 
@@ -152,7 +194,6 @@ deployment_groups:
           torch-tb-profiler>=0.4.3
           torchao>=0.9.0
           compressed-tensors>=0.9.3
-
           hydra-core>=1.3.2
           pretty-midi>=0.2.10
           tensorboard>=2.18.0 # Adjusted to match TF version
@@ -169,145 +210,31 @@ deployment_groups:
           numba>=0.61.2
           setuptools>=78.1.0
           cmake>=3.25.0,<=3.26.3
-          # appworld>=0.1.3 -- dependency conflict
           coverage>=7.6.12
           httptools>=0.6.4
           xgrammar>=0.1.18
           singleton-decorator>=1.0.0
           regex>=2024.11.6
-
           git+https://github.com/apple/ml-cross-entropy.git
       - type: shell
-        destination: install_python_packages.sh
+        destination: install_python_packages_isolated.sh
         content: |
           #!/bin/bash
           set -e -o pipefail
-          echo "--- Upgrading pip for Python 3.11 ---"
-          python3.11 -m pip install --upgrade pip
-          echo "--- Installing packages from requirements.txt ---"
-          python3.11 -m pip install --no-cache-dir -r /tmp/requirements.txt
-          echo "--- Python package installation complete ---"
+          echo "--- Creating isolated Python environment in /opt/apps/python/3.11 ---"
+          mkdir -p /opt/apps/python
+          python3.11 -m venv /opt/apps/python/3.11
+          echo "--- Installing packages into isolated environment ---"
+          /opt/apps/python/3.11/bin/pip install --upgrade pip
+          /opt/apps/python/3.11/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+          echo "--- Package installation complete ---"
 
-      - type: shell
-        destination: install_slurm.sh
+      # --- STAGE 3: Make the isolated Python the system default for users ---
+      - type: data
+        destination: /etc/profile.d/00-python-app-env.sh
         content: |
           #!/bin/bash
-          set -e -o pipefail
-          ansible-pull \
-              -U https://github.com/GoogleCloudPlatform/slurm-gcp -C $(vars.build_slurm_from_git_ref) \
-              -i localhost, --limit localhost --connection=local \
-              -e @/var/tmp/slurm_vars.json \
-              ansible/playbook.yml
-      # this duplicates the ulimits configuration of the HPC VM Image
-      - type: data
-        destination: /etc/security/limits.d/99-unlimited.conf
-        content: |
-          * - memlock unlimited
-          * - nproc unlimited
-          * - stack unlimited
-          * - nofile 1048576
-          * - cpu unlimited
-          * - rtprio unlimited
-
-      - type: ansible-local
-        destination: install_cuda_dcgm.yml
-        content: |
-          ---
-          - name: Install CUDA & DCGM
-            hosts: all
-            become: true
-            vars:
-              distribution: "{{ ansible_distribution | lower }}{{ ansible_distribution_version | replace('.','') }}"
-              cuda_repo_url: https://developer.download.nvidia.com/compute/cuda/repos/{{ distribution }}/x86_64/cuda-keyring_1.1-1_all.deb
-              cuda_repo_filename: /tmp/{{ cuda_repo_url | basename }}
-              enable_nvidia_dcgm: false
-              nvidia_packages:
-              - cuda-toolkit-12-8
-              - datacenter-gpu-manager-4-cuda12
-            tasks:
-            - name: Download NVIDIA repository package
-              ansible.builtin.get_url:
-                url: "{{ cuda_repo_url }}"
-                dest: "{{ cuda_repo_filename }}"
-            - name: Install NVIDIA repository package
-              ansible.builtin.apt:
-                deb: "{{ cuda_repo_filename }}"
-                state: present
-            - name: Reduce NVIDIA repository priority
-              ansible.builtin.copy:
-                dest: /etc/apt/preferences.d/cuda-repository-pin-600
-                mode: 0o0644
-                owner: root
-                group: root
-                content: |
-                  Package: nsight-compute
-                  Pin: origin *ubuntu.com*
-                  Pin-Priority: -1
-
-                  Package: nsight-systems
-                  Pin: origin *ubuntu.com*
-                  Pin-Priority: -1
-
-                  Package: *
-                  Pin: release l=NVIDIA CUDA
-                  Pin-Priority: 400
-            - name: Install CUDA & DCGM
-              ansible.builtin.apt:
-                name: "{{ item }}"
-                update_cache: true
-              loop: "{{ nvidia_packages }}"
-            - name: Create nvidia-persistenced override directory
-              ansible.builtin.file:
-                path: /etc/systemd/system/nvidia-persistenced.service.d
-                state: directory
-                owner: root
-                group: root
-                mode: 0o755
-            - name: Configure nvidia-persistenced override
-              ansible.builtin.copy:
-                dest: /etc/systemd/system/nvidia-persistenced.service.d/persistence_mode.conf
-                owner: root
-                group: root
-                mode: 0o644
-                content: |
-                  [Service]
-                  ExecStart=
-                  ExecStart=/usr/bin/nvidia-persistenced --user nvidia-persistenced --verbose
-              notify: Reload SystemD
-            handlers:
-            - name: Reload SystemD
-              ansible.builtin.systemd:
-                daemon_reload: true
-            post_tasks:
-            - name: Disable NVIDIA DCGM by default (enable during boot on GPU nodes)
-              ansible.builtin.service:
-                name: nvidia-dcgm.service
-                state: stopped
-                enabled: false
-            - name: Disable nvidia-persistenced SystemD unit (enable during boot on GPU nodes)
-              ansible.builtin.service:
-                name: nvidia-persistenced.service
-                state: stopped
-                enabled: false
-
-      - type: ansible-local
-        destination: install_ibverbs_utils.yml
-        content: |
-          ---
-          - name: Install ibverbs-utils
-            hosts: all
-            become: true
-            tasks:
-            - name: Install Linux Modules Extra
-              ansible.builtin.package:
-                name:
-                - ibverbs-utils
-                state: present
-      - type: data
-        destination: /etc/enroot/enroot.conf
-        content: |
-          ENROOT_CONFIG_PATH     ${HOME}/.enroot
-
+          export PATH="/opt/apps/python/3.11/bin:$PATH"
 
 - group: image
   modules:
