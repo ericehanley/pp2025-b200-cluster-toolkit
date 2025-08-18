@@ -1,23 +1,49 @@
-# A4-High Cluster Toolkit with Custom Image
-This repository contains two separate deployments:
+# A4-High (B200) Slurm Cluster Deployment with Custom Image
 
- * Slurm Custom Image - create custom image with specified packages.
+Derived from https://github.com/GoogleCloudPlatform/cluster-toolkit/tree/main/examples/machine-learning/a4-highgpu-8g.
+
+This repository contains three separate deployments:
+
+ * Create Custom Slurm Image
    * slurm-custom-image-blueprint.yml
    * slurm-custom-image-deploy.yml
- * Slurm Custom Image with A4 Cluster - create custom image with specified packages and deploy on single SPOT node a4-highgpu-8g cluster.
+ * Launch Slurm Cluster
+   * slurm-custom-image-transfer-blueprint.yml
+   * slurm-custom-image-transfer-deploy.yml
+ * Create Custom Slurm Image and Launch in the Same Project
    * slurm-custom-img-cluster-blueprint.yml
    * slurm-custom-img-cluster-deploy.yml
 
 The deployments can be easily updated to leverage an A4 reservation or other provisioning approach.
 
-Note - the custom packages will need to be updated directly in blueprint files; requirements.txt is for reference only.
+*Note*: The custom packages will need to be updated directly in blueprint files; requirements.txt is for reference only.
 
-## Example Deployment Process
+## Process for Creating Image in Project A and Launching Cluster in Project B
+
+*Note:* You will need to manually update the deploy files to specify the correct project, etc.
+
+Step 1: Create Custom Image in Project A using slurm-custom-image-blueprint.yml and slurm-custom-image-deploy.yml.
+```shell
+./gcluster deploy -d pp_image_workflow/slurm-custom-image-deploy.yml pp_image_workflow/slurm-custom-image-blueprint.yml --auto-approve
+```
+
+Step 2: gcloud command to transfer to Project B
+```shell
+gcloud compute images create IMAGE_NAME --project=PROJECT_B --family=COPIED_IMAGE_FAMILY_NAME  --source-image=IMAGE_NAME_IN_PROJECT_A --source-image-project=PROJECT_A
+```
+
+Step 3: Deploy in Project B using slurm-custom-img-cluster-blueprint.yml and slurm-custom-img-cluster-deploy.yml.
+```shell
+./gcluster deploy -d pp_image_workflow/slurm-custom-image-transfer-deploy.yml pp_image_workflow/slurm-custom-image-transfer-blueprint.yml --auto-approve
+```
+
+## Example Deployment Process in a Single Project
 **Reference:**
  * Set up Cluster Toolkit: https://cloud.google.com/cluster-toolkit/docs/setup/configure-environment
+  * Ensure you have all necessary packages for Cluster Toolkit
  * Create an AI-optimized Slurm Cluster with A4: https://cloud.google.com/cluster-toolkit/docs/quickstarts/create-a-slurm-cluster-with-a4
 
-**Deployment:**
+**Deployment Steps:**
 ```shell
 export PROJECT_ID=northam-ce-mlai-tpu
 export PROJECT_NUMBER=xxx
@@ -65,12 +91,9 @@ make
 Slurm filestore cluster will need to have deletion protection disabled for deletion.
 
 ```shell
-  # Remove deletion protection if necessary.
-  gcloud filestore instances update $FILESTORE_INSTANCE_NAME \
-      --no-deletion-protection
-
-
-slurm-final-custom-image-please-7e712925
+# Remove deletion protection if necessary.
+gcloud filestore instances update $FILESTORE_INSTANCE_NAME \
+    --no-deletion-protection
 
 # Delete deployment
 ./gcluster destroy DEPLOYMENT_FOLDER --auto-approve

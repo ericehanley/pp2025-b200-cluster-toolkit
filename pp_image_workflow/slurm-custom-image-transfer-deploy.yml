@@ -16,14 +16,17 @@
 terraform_backend_defaults:
   type: gcs
   configuration:
-    bucket: eh-cross-account-transfer # supply existing bucket to store Terraform state
+    bucket:  slurm-custom-img-cluster-bucket # supply existing bucket to store Terraform state
 
 vars:
-  deployment_name: slurm-custom-image-venv
-  project_id: gpu-launchpad-playground
+  deployment_name: slurm-custom-image-transfer
+  project_id: northam-ce-mlai-tpu
   region: us-central1
   zone: us-central1-b
-  #a4h_cluster_size: 1
+  a4h_cluster_size: 1
+  image_project_id: northam-ce-mlai-tpu
+  image_family: slurm-custom-image-venv
+
   #a4h_reservation_name: # supply a4-highgpu-8g reservation name OR
   #a4h_dws_flex_enabled: true # OR
-  #a4h_enable_spot_vm: true
+  a4h_enable_spot_vm: true
